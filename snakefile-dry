@@ -1,0 +1,139 @@
+import glob
+import os
+import re
+
+import pandas as pd
+import yaml
+
+configfile: "config-dry.yaml"
+
+OUT = config["out_dir"]
+FCS_DIR = config["fcs_dir"]
+PAT = re.compile(config["sample_regex"])
+
+_all = sorted(os.path.basename(f)[:-4] for f in glob.glob(os.path.join(FCS_DIR, "*.fcs")))
+SAMPLES = [s for s in _all if PAT.match(s)]
+if not SAMPLES:
+    raise ValueError(f"no FCS files in {FCS_DIR} match sample_regex")
+if len(SAMPLES) != len(_all):
+    print(f"WARNING: skipped non-matching FCS: {sorted(set(_all) - set(SAMPLES))}")
+
+# effective config (incl. --config overrides) handed to scripts; rewritten only if changed
+os.makedirs(OUT, exist_ok=True)
+CFG = f"{OUT}/config.used.yaml"
+_txt = yaml.safe_dump(dict(config), sort_keys=False)
+if not os.path.exists(CFG) or open(CFG).read() != _txt:
+    with open(CFG, "w") as fh:
+        fh.write(_txt)
+
+wildcard_constraints:
+    sample="|".join(re.escape(s) for s in SAMPLES),
+
+
+rule all:
+    input:
+        f"{OUT}/01_preprocess/qc_summary.csv",
+        f"{OUT}/02_cluster/cells.npz",
+        f"{OUT}/03_diff/da_results.csv",
+        f"{OUT}/03_diff/ds_results.csv",
+
+
+rule metadata:
+    output:
+        f"{OUT}/metadata.csv",
+    run:
+        rows = []
+        for s in SAMPLES:
+            d = PAT.match(s).groupdict()
+            rows.append({"sample_id": s, **d, "fcs": os.path.join(FCS_DIR, s + ".fcs")})
+        df = pd.DataFrame(rows)
+        want = {config["ref_condition"], config["alt_condition"]}
+        found = set(df["condition"])
+        if not want <= found:
+            raise ValueError(f"conditions {want} not all found in filenames: {found}")
+        extra = found - want
+        if extra:
+            raise ValueError(f"unexpected conditions {extra}; fix sample_regex or ref/alt_condition")
+        df.to_csv(output[0], index=False)
+        print(df.groupby("condition").size())
+
+
+rule preprocess:
+    input:
+        fcs=os.path.join(FCS_DIR, "{sample}.fcs"),
+        cfg=CFG,
+        code=["scripts/01_preprocess.py", "scripts/common.py"],
+    output:
+        npz=f"{OUT}/01_preprocess/{{sample}}.npz",
+        audit=f"{OUT}/01_preprocess/{{sample}}_audit.csv",
+        png=f"{OUT}/01_preprocess/{{sample}}_qc.png",
+    log:
+        f"{OUT}/logs/01_preprocess_{{sample}}.log",
+    threads: 1
+    shell:
+        "python scripts/01_preprocess.py --config {input.cfg} --sample {wildcards.sample} "
+        "--fcs {input.fcs} --out-npz {output.npz} --out-audit {output.audit} --out-png {output.png} "
+        "> {log} 2>&1"
+
+
+rule qc_summary:
+    input:
+        audits=expand(f"{OUT}/01_preprocess/{{sample}}_audit.csv", sample=SAMPLES),
+        meta=f"{OUT}/metadata.csv",
+    output:
+        csv=f"{OUT}/01_preprocess/qc_summary.csv",
+        png=f"{OUT}/01_preprocess/qc_retention.png",
+    run:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        df = pd.concat([pd.read_csv(p) for p in input.audits]).merge(
+            pd.read_csv(input.meta)[["sample_id", "condition"]], on="sample_id")
+        df = df.sort_values(["condition", "sample_id"])
+        df.to_csv(output.csv, index=False)
+        fig, ax = plt.subplots(figsize=(0.6 * len(df) + 3, 4), dpi=config["dpi"])
+        cols = [c for c in df.columns if c.startswith("after_")]
+        for c in cols:
+            ax.plot(df.sample_id, 100 * df[c] / df.raw_events, marker="o", label=c)
+        ax.set_ylabel("% of raw events"); ax.set_ylim(0, 105); ax.legend(fontsize=7)
+        ax.set_xticks(range(len(df)), [f"{s}\n({c})" for s, c in zip(df.sample_id, df.condition)],
+                      rotation=90, fontsize=7)
+        plt.tight_layout(); plt.savefig(output.png, bbox_inches="tight"); plt.close()
+
+
+rule cluster_dimred:
+    input:
+        npz=expand(f"{OUT}/01_preprocess/{{sample}}.npz", sample=SAMPLES),
+        meta=f"{OUT}/metadata.csv",
+        cfg=CFG,
+        code=["scripts/02_cluster_dimred.py", "scripts/common.py"],
+    output:
+        cells=f"{OUT}/02_cluster/cells.npz",
+        counts=f"{OUT}/02_cluster/cluster_counts.csv",
+        medians=f"{OUT}/02_cluster/cluster_medians.csv",
+        ann=f"{OUT}/02_cluster/cluster_annotation.csv",
+    log:
+        f"{OUT}/logs/02_cluster_dimred.log",
+    threads: 16  # capped at --cores
+    shell:
+        "NUMBA_NUM_THREADS={threads} OMP_NUM_THREADS={threads} "
+        "python scripts/02_cluster_dimred.py --config {input.cfg} --metadata {input.meta} "
+        "--inputs {input.npz} --outdir {OUT}/02_cluster --threads {threads} > {log} 2>&1"
+
+
+rule diff_analysis:
+    input:
+        cells=f"{OUT}/02_cluster/cells.npz",
+        ann=f"{OUT}/02_cluster/cluster_annotation.csv",
+        meta=f"{OUT}/metadata.csv",
+        cfg=CFG,
+        code=["scripts/03_diff_analysis.py", "scripts/common.py"],
+    output:
+        da=f"{OUT}/03_diff/da_results.csv",
+        ds=f"{OUT}/03_diff/ds_results.csv",
+    log:
+        f"{OUT}/logs/03_diff_analysis.log",
+    threads: 1
+    shell:
+        "python scripts/03_diff_analysis.py --config {input.cfg} --metadata {input.meta} "
+        "--cells {input.cells} --annotation {input.ann} --outdir {OUT}/03_diff > {log} 2>&1"

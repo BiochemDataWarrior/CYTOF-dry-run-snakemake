@@ -1,0 +1,63 @@
+# ============================ I/O ============================
+fcs_dir: "dry-run-fcs"            # real data: "data/raw"
+out_dir: "results"
+# applied to the file stem (no .fcs); needs a named 'condition' group
+sample_regex: '^(?P<prefix>.+?)_(?P<condition>[A-Za-z]+)_(?P<replicate>\d+)_\d+_\d+$'
+ref_condition: "control"          # real data: "Untrained"
+alt_condition: "treatment"        # real data: "WGP"
+ground_truth_suffix: "_ground_truth.csv"   # real data: ""
+junk_label_regex: "junk|debris|bead|dead|doublet|noise|artifact|non.?bio"
+seed: 1
+dpi: 300
+
+# ============================ stage 1: preprocess ============================
+cofactor: 5
+qc_channels:                      # first match wins; isotope, PnN, PnS or marker name
+  dna1: ["191Ir", "DNA1", "DNA-1"]
+  dna2: ["193Ir", "DNA2", "DNA-2"]
+  bead: ["140Ce", "Bead", "Beads", "EQBeads"]   # isotope-only specs skip channels labeled as markers
+  live: ["195Pt", "194Pt", "Cisplatin", "Live", "Viability", "LiveDead", "103Rh"]
+  cd45: ["CD45"]
+gates:                            # thresholds on arcsinh(x/cofactor); "auto" = histogram valley
+  dna:     {enabled: true, min: auto, fallback_min: 2.5}
+  doublet: {enabled: true, max: auto, mad_k: 4.0}   # auto = median + k*MAD of mean DNA
+  bead:    {enabled: false, max: auto, fallback_max: 3.0}   # this panel has no bead channel (140Ce = Ly6C)
+  live:    {enabled: true, max: auto, fallback_max: 3.5}
+  cd45:    {enabled: true, min: auto, fallback_min: 1.5}
+min_events_fail: 500
+panel:
+  # [] for both = every marker used for clustering AND state tests (not recommended)
+  type_markers: [CD45, CD3e, CD4, CD8a, CD19, B220, CD11b, CD11c, Ly6G, Ly6C, NK1.1, MHCII,
+                 F4_80, CD64, CD115, SiglecF, CD49b, TCRb, TCRgd, CD1d, CD5, CD24, CD21_35,
+                 CD23, IgD, IgM, CD138, CD117, CD127, CD25, FoxP3, CD44, CD62L]
+  state_markers: [CD86, CD69, Ki67, pSTAT3, pSTAT5, pERK1_2, pS6, CXCR4, CCR7, PD1, PDL1,
+                  CTLA4, ICOS, CD103, CD38, CD9, CD27, CD28, CD150, Tbet, GATA3]
+  exclude_markers: []
+  exclude_isotopes: []            # isotopes to drop even if labeled as a marker
+
+# ============================ stage 2: cluster ============================
+flowsom:
+  backend: auto                   # auto | pyflowsom | numpy
+  xdim: 10
+  ydim: 10
+  rlen: 10
+  n_metaclusters: 20              # dry-run fixture has 7 populations: 8 gives ARI 0.998, 20 over-splits (ARI 0.74)
+  train_max_cells: 0              # 0 = train SOM on all cells
+umap:
+  enabled: true
+  max_cells: 0                    # 0 = embed all cells
+  n_neighbors: 15
+  min_dist: 0.1
+  deterministic: true             # true = seeded (single-threaded UMAP)
+annotation:
+  min_score: 0.5
+  signatures: {}
+  # example:
+  #   CD8_T: {pos: [CD3e, CD8a], neg: [CD4, CD19]}
+  #   CD4_T: {pos: [CD3e, CD4],  neg: [CD8a, CD19]}
+
+# ============================ stage 3: differential ============================
+diff:
+  alpha: 0.05
+  min_cells_per_sample_cluster: 10
+  min_samples_per_group: 3
